@@ -1,4 +1,4 @@
-# RACF (Recommendation system based on Array gene expression Cross-Mapping Framework)
+# RACF
 
 ## Features
 
