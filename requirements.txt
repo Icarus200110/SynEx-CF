@@ -1,0 +1,17 @@
+torch>=1.10
+pytorch-lightning>=1.4
+scanpy>=1.8
+python>=3.7
+torch_geometric
+dgl
+timm
+einops
+scipy
+scikit-learn
+pandas
+numpy
+matplotlib
+seaborn
+Pillow
+scprep
+anndata
