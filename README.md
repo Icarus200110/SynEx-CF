@@ -1,4 +1,4 @@
-# Train Files: Spatial Transcriptomics Training Modules
+# SynEX-CF
 
 This directory contains three main modules for spatial transcriptomics analysis:
 
@@ -82,7 +82,7 @@ train_files/
 
 ***
 
-## Module 2: SynEx\_CF (Gene Expression Prediction)
+## Module 2: SynEx(Gene Expression Prediction)
 
 ### Model Architecture
 
