@@ -7,7 +7,7 @@ from typing import Optional, Tuple, List
 class PatchEmbed(nn.Module):
     """图像块嵌入模块，将图像分割为块并投影到嵌入空间"""
     
-    def __init__(self, img_size: int = 64, patch_size: int = 16, in_chans: int = 3, embed_dim: int = 384):
+    def __init__(self, img_size: int = 224, patch_size: int = 16, in_chans: int = 3, embed_dim: int = 384):
         """
         初始化图像块嵌入模块
         
@@ -200,17 +200,10 @@ class Block(nn.Module):
 class SpotViT(nn.Module):
     """轻量化ViT模型，用于空间转录组学spot分类"""
     
-    def __init__(self, num_classes: int, img_size: int = 64, patch_size: int = 16, in_chans: int = 3,
+    def __init__(self, num_classes: int, img_size: int = 224, patch_size: int = 16, in_chans: int = 3,
                  embed_dim: int = 384, depth: int = 6, num_heads: int = 6, mlp_ratio: float = 4.,
                  qkv_bias: bool = True, drop_rate: float = 0., attn_drop_rate: float = 0.,
                  norm_layer: nn.Module = nn.LayerNorm, **kwargs):
-        # 从kwargs中获取img_size，保持与原有代码的兼容性
-        if 'img_size' in kwargs:
-            img_size = kwargs['img_size']
-        # 原有代码中可能将输入图像大小命名为patch_size，这里需要特别处理
-        if 'patch_size' in kwargs:
-            # 注意：这里的patch_size实际上是输入图像的大小
-            img_size = kwargs['patch_size']
         """
         初始化轻量化ViT模型
         
@@ -245,7 +238,8 @@ class SpotViT(nn.Module):
         num_patches = self.patch_embed.num_patches
         
         # 位置嵌入
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         
         # Transformer块
@@ -266,9 +260,11 @@ class SpotViT(nn.Module):
         self.norm = norm_layer(embed_dim)
         
         # 分类头
-        self.head = nn.Linear(embed_dim, num_classes)
+        self.head = nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.GELU(),
+                                  nn.Linear(embed_dim, num_classes))
         
         # 权重初始化
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         self.apply(self._init_weights)
     
@@ -307,6 +303,7 @@ class SpotViT(nn.Module):
         # 图像块嵌入
         x = self.patch_embed(x)
         # 添加位置嵌入
+        x = torch.cat((self.cls_token.expand(x.shape[0], -1, -1), x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
         
@@ -317,9 +314,9 @@ class SpotViT(nn.Module):
         # 归一化
         x = self.norm(x)
         
-        # 全局平均池化，只使用cls_token或平均所有patch
-        # [B*num_spots, num_patches, embed_dim] -> [B*num_spots, embed_dim]
-        x = x.mean(dim=1)
+        # Use the dedicated class token from the manuscript.
+        # [B*num_spots, P+1, embed_dim] -> [B*num_spots, embed_dim]
+        x = x[:, 0]  # Final normalized class token.
         
         # 分类头
         x = self.head(x)
@@ -383,32 +380,16 @@ def spotvit_base(num_classes: int, **kwargs) -> SpotViT:
     )
 
 
-def create_spotresnet(num_classes: int, model_type: str = 'spotvit_small', **kwargs) -> nn.Module:
-    """
-    创建模型的工厂函数，保持与原有接口兼容
-    
-    Args:
-        num_classes: 分类类别数
-        model_type: 模型类型，可选'spotvit_tiny', 'spotvit_small', 'spotvit_base'
-        **kwargs: 其他参数
-        
-    Returns:
-        构建好的轻量化ViT模型
-    """
-    if model_type == 'spotvit_tiny':
-        return spotvit_tiny(num_classes, **kwargs)
-    elif model_type == 'spotvit_small':
-        return spotvit_small(num_classes, **kwargs)
-    elif model_type == 'spotvit_base':
-        return spotvit_base(num_classes, **kwargs)
-    else:
-        # 保持向后兼容，默认使用spotvit_small
-        return spotvit_small(num_classes, **kwargs)
+def create_spotresnet(num_classes: int, model_type: str = 'spotvit_small', **kwargs):
+    """Legacy factory name; patch_size historically meant the whole spot image."""
+    if 'img_size' not in kwargs:
+        kwargs['img_size'] = kwargs.pop('patch_size', 224)
+    kwargs.setdefault('patch_size', 16)
+    factories = {'spotvit_tiny': spotvit_tiny, 'spotvit_small': spotvit_small,
+                 'spotvit_base': spotvit_base}
+    if model_type not in factories:
+        raise ValueError(f'Unknown tissue classifier: {model_type}')
+    return factories[model_type](num_classes, **kwargs)
 
 
-# 保持原有类名的别名，确保兼容性
 SpotResNet = SpotViT
-
-
-if __name__ == "__main__":
-    print(create_spotresnet(6, 'spotvit_small'))

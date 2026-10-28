@@ -1,133 +1,40 @@
-# 简单Spot分类器配置文件
-# 用于空间转录组学数据的图像分类任务
-
-# 数据配置
+# A fold is one outer held-out section; classifier selection is nested inside training.
+seed: 42
 data:
-  data_root: "data"  # 数据根目录
-  train_samples: ["A1", "B1", "E1", "F1", "G2", "H1","C1","D1"]  # 训练样本列表
-  val_samples: null  # 设置为null表示将从训练数据集中随机选择验证样本
-  test_samples: ["A1", "C1", "D1"]  # 测试样本列表（可选）
-  
-  # 数据处理参数
-  patch_size: 64  # patch大小
-  max_spots_per_sample: 1000  # 每个样本最大spot数量
-  batch_size: 1   # 批次大小
-  num_workers: 4  # 数据加载器工作进程数
-  
-  # 数据预处理选项
-  auto_patch_size: false  # 是否自动确定patch大小
-  skip_undetermined: false  # 是否跳过未确定标签的spot，设置为false以分类undetermined类别
-  undersample_majority: true  # 启用对多数类的欠采样，解决类别不平衡
-  undersample_ratio: 0.3  # 欠采样比例，降低多数类权重
-  validation_split: 0.1  # 验证集划分比例（当val_samples为null时生效）
-
-# 模型配置
+  dataset: her2st
+  data_root: data
+  manifest: null
+  fold: 0
+  train_samples: null
+  val_samples: null
+  test_samples: null
+  patch_size: 224
+  max_spots_per_sample: null
+  batch_size: 1
+  num_workers: 0
+  auto_patch_size: false
+  skip_undetermined: true
+  undersample_majority: false
+  validation_split: 0.1
 model:
-  type: "spotvit_small"  # 模型类型: "spotvit_tiny", "spotvit_small", "spotvit_base"
-  patch_size: 64  # patch大小，与data.patch_size保持一致
-  pretrained_path: null  # 预训练权重路径（可选）
-
-# 训练配置
+  type: spotvit_small
+  img_size: 224
+  token_patch_size: 16
 training:
-  epochs: 100  # 训练轮数
-  early_stopping_patience: 15  # 早停耐心值
-  early_stopping_min_delta: 0.001  # 早停最小改进
-  gradient_clip_norm: 1.0  # 梯度裁剪范数
-  save_interval: 10  # 保存检查点间隔
-
-# 优化器配置
+  epochs: 100
+  spot_chunk_size: 128
+  gradient_clip_norm: 1.0
 optimizer:
-  type: "adamw"  # 优化器类型: "adam", "adamw", "sgd"
-  learning_rate: 0.0005  # 降低学习率，减少过拟合
-  weight_decay: 0.05  # 增加权重衰减，增强正则化
-
-# 学习率调度器配置
+  type: adam
+  learning_rate: 0.0005
 scheduler:
-  type: "cosine"  # 调度器类型: "step", "cosine", "reduce_on_plateau"
-  step_size: 30  # StepLR步长
-  gamma: 0.1  # StepLR衰减因子
-  factor: 0.5  # ReduceLROnPlateau衰减因子
-  patience: 10  # ReduceLROnPlateau耐心值
-
-# 损失函数配置
-loss:
-  type: "focal"  # 损失函数类型: "cross_entropy", "focal"
-  alpha: [2.5, 4.0, 5.0, 1.5, 3.0, 1.0, 2.0]  # 调整类别权重：增加breast glands(2), cancer in situ(3), immune infiltrate(5)的权重，降低invasive cancer(6)的权重
-  gamma: 2.5  # 增加gamma值，更关注难分类样本
-
-# 日志配置
-logging:
-  level: "INFO"  # 日志级别: "DEBUG", "INFO", "WARNING", "ERROR"
-  save_to_file: true  # 是否保存日志到文件
-  log_dir: "logs"  # 日志目录
-
-# 路径配置
-paths:
-  output_dir: "outputs"  # 输出目录
-  log_dir: "logs"  # 日志目录
-  checkpoint_dir: "checkpoints"  # 检查点目录
-
-# 设备配置
+  type: step
+  step_size: 30
+  gamma: 0.1
 device:
-  use_cuda: true  # 是否使用CUDA
-  mixed_precision: false  # 是否使用混合精度训练
-
-# 数据增强配置
-augmentation:
-  enabled: true  # 是否启用数据增强
-  rotation: true  # 随机旋转
-  flip: true  # 随机翻转
-  color_jitter: true  # 颜色抖动
-  gaussian_noise: false  # 高斯噪声
-  brightness: 0.2  # 亮度调整范围
-  contrast: 0.2  # 对比度调整范围
-  saturation: 0.2  # 饱和度调整范围
-  hue: 0.1  # 色调调整范围
-
-# 验证配置
-validation:
-  enabled: true  # 是否启用验证
-  frequency: 1  # 验证频率（每N个epoch验证一次）
-  metrics: ["accuracy", "precision", "recall", "f1"]  # 验证指标
-
-# 可视化配置
-visualization:
-  enabled: true  # 是否启用可视化
-  plot_training_curves: true  # 绘制训练曲线
-  plot_confusion_matrix: true  # 绘制混淆矩阵
-  save_predictions: true  # 保存预测结果
-
-# 实验配置
-experiment:
-  name: "resnet_spot_classifier"  # 实验名称
-  description: "ResNet-based spot classification for spatial transcriptomics"  # 实验描述
-  tags: ["spatial_transcriptomics", "classification", "resnet"]  # 实验标签
-
-# 调试配置
-debug:
-  enabled: false  # 是否启用调试模式
-  log_level: "INFO"  # 日志级别
-  save_intermediate: false  # 是否保存中间结果
-  profile_memory: false  # 是否分析内存使用
-
-# 模型变体配置（可选）
-
-# 推理配置
+  use_cuda: true
+  mixed_precision: true
 inference:
-  batch_size: 64  # 推理批次大小
-  output_probabilities: true  # 是否输出概率
-  save_features: false  # 是否保存特征
-  visualization: true  # 是否可视化结果
+  batch_size: 1
+  spot_chunk_size: 128
 
-# 性能优化配置
-performance:
-  compile_model: false  # 是否编译模型（PyTorch 2.0+）
-  channels_last: false  # 是否使用channels_last内存格式
-  benchmark_cudnn: true  # 是否启用cuDNN基准测试
-
-# 分布式训练配置（可选）
-distributed:
-  enabled: false  # 是否启用分布式训练
-  backend: "nccl"  # 分布式后端
-  world_size: 1  # 世界大小
-  rank: 0  # 当前进程排名

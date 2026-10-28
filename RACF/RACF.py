@@ -1,285 +1,167 @@
+"""Retrieval-Augmented Collaborative Filtering on paired core/full references."""
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.decomposition import PCA
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
 import faiss
-import time
+from sklearn.cluster import KMeans
+
 
 class RACF:
-
-    def __init__(self, database_path, k=10, n_candidates=5000, n_precise=1000, database_gene_order=None):
+    def __init__(self, database_path, k=10, n_candidates=5000, n_precise=1000,
+                 database_gene_order=None, tau=0.1, nlist=100, pq_m=16, nbits=8,
+                 nprobe=10, training_sections=None, validation_sections=(),
+                 test_sections=(), reference_sections=None, seed=42):
+        if min(k, n_candidates, n_precise, nlist, pq_m, nbits, nprobe) < 1 or tau <= 0:
+            raise ValueError('RACF counts and temperature must be positive.')
+        if k > n_precise or n_precise > n_candidates:
+            raise ValueError('Require cluster count <= reranked K <= coarse candidate count.')
         self.database_path = database_path
-        self.k = k
-        self.n_candidates = n_candidates
-        self.n_precise = n_precise
         self.database_gene_order_path = database_gene_order
-        self.database = None
-        self.database_vectors = None
-        self.database_gene_order = None
-        self.spot_vectors = None
-        self.spot_gene_order = None
-        self.shared_genes = None
-        self.canonical_gene_order = None
-        self.pca = None
+        self.k, self.n_candidates, self.n_precise = k, n_candidates, n_precise
+        self.tau, self.nlist, self.pq_m = tau, nlist, pq_m
+        self.nbits, self.nprobe, self.seed = nbits, nprobe, seed
+        self.training_sections = None if training_sections is None else set(training_sections)
+        self.excluded_sections = set(validation_sections) | set(test_sections)
+        if self.training_sections is not None and self.training_sections & self.excluded_sections:
+            raise ValueError('Reference training sections overlap held-out sections.')
+        self.reference_sections = reference_sections
         self.faiss_index = None
 
-    def load_gene_order(self, gene_order_path):
-        if gene_order_path is None:
+    @staticmethod
+    def load_gene_order(value):
+        if value is None:
             return None
-        gene_order = []
-        with open(gene_order_path, 'r') as f:
-            for line in f:
-                gene = line.strip()
-                if gene:
-                    gene_order.append(gene)
-        return gene_order
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return list(value)
+        return [line.strip() for line in Path(value).read_text(encoding='utf-8').splitlines()
+                if line.strip()]
 
-    def align_gene_order(self, data, data_gene_order, target_gene_order):
-        if data_gene_order is None or target_gene_order is None:
-            return data
+    @staticmethod
+    def _read(value):
+        return pd.read_csv(value, sep='\t') if isinstance(value, (str, Path)) else value.copy()
 
-        if data_gene_order == target_gene_order:
-            return data
-
-        gene_to_idx = {gene: idx for idx, gene in enumerate(data_gene_order)}
-
-        common_genes = []
-        for gene in target_gene_order:
-            if gene in gene_to_idx:
-                common_genes.append(gene)
-
-        if len(common_genes) == 0:
-            raise ValueError("没有共同的基因，请检查基因顺序文件是否正确")
-
-        if len(common_genes) != len(target_gene_order):
-            print(f"警告: 只有 {len(common_genes)}/{len(target_gene_order)} 个基因匹配")
-
-        aligned_data = np.zeros((data.shape[0], len(target_gene_order)))
-
-        for new_idx, gene in enumerate(target_gene_order):
-            if gene in gene_to_idx:
-                old_idx = gene_to_idx[gene]
-                aligned_data[:, new_idx] = data[:, old_idx]
-
-        return aligned_data
+    @staticmethod
+    def _matrix(frame, genes):
+        if len(set(genes)) != len(genes) or not set(genes).issubset(frame.columns):
+            raise ValueError('Gene identifiers must be unique and present in the expression matrix.')
+        array = frame[genes].to_numpy(dtype=np.float32)
+        if not np.isfinite(array).all():
+            raise ValueError('RACF expression must be finite and already library/log2 normalized.')
+        return np.ascontiguousarray(array)
 
     def load_data(self, spot_data=None, spot_gene_order=None):
-        print("加载数据库数据...")
-        self.database = pd.read_csv(self.database_path, sep='\t')
-
-        self.database_gene_order = self.load_gene_order(self.database_gene_order_path)
-
-        if self.database_gene_order is None:
-            self.database_vectors = self.database.iloc[:, 1:].values
-            self.database_gene_order = self.database.columns[1:].tolist()
+        self.database = self._read(self.database_path)
+        if self.database.columns.duplicated().any():
+            raise ValueError('Duplicate database columns.')
+        if 'section' in self.database:
+            sections = self.database['section'].astype(str).to_numpy()
+        elif self.reference_sections is not None:
+            sections = np.asarray(self.reference_sections, dtype=str)
+            if len(sections) != len(self.database):
+                raise ValueError('Reference section metadata does not match database rows.')
         else:
-            if len(self.database_gene_order) != self.database.shape[1] - 1:
-                raise ValueError(f"数据库基因顺序文件中的基因数量 ({len(self.database_gene_order)}) 与数据库列数 ({self.database.shape[1] - 1}) 不匹配")
-            self.database_vectors = self.database[self.database_gene_order].values
-
+            raise ValueError('RACF requires reference section provenance for held-out exclusion.')
+        if self.training_sections is None:
+            raise ValueError('Explicit training_sections are required to construct the reference.')
+        keep = np.isin(sections, list(self.training_sections))
+        keep &= ~np.isin(sections, list(self.excluded_sections))
+        self.database = self.database.loc[keep].reset_index(drop=True)
+        if len(self.database) < 2:
+            raise ValueError('IVF-PQ requires at least two permitted reference profiles.')
+        metadata = {'section', 'spot_id', 'patient', self.database.columns[0]}
+        self.database_gene_order = (self.load_gene_order(self.database_gene_order_path)
+                                    or [c for c in self.database if c not in metadata])
+        # FULL measured expression remains separate from the 785-dimensional retrieval vectors.
+        self.full_gene_order = list(self.database_gene_order)
+        self.full_expression = self._matrix(self.database, self.full_gene_order)
         if spot_data is not None:
-            print("加载Spot数据...")
-            if isinstance(spot_data, str):
-                self.spot_data = pd.read_csv(spot_data, sep='\t')
-            else:
-                self.spot_data = spot_data
-
-            self.spot_gene_order = self.load_gene_order(spot_gene_order)
-
-            if self.spot_gene_order is None:
-                self.spot_vectors = self.spot_data.iloc[:, 1:].values
-                self.spot_gene_order = self.spot_data.columns[1:].tolist()
-            else:
-                self.spot_vectors = self.spot_data[self.spot_gene_order].values
+            self.spot_data = self._read(spot_data)
+            metadata = {'section', 'spot_id', 'patient', self.spot_data.columns[0]}
+            self.spot_gene_order = (self.load_gene_order(spot_gene_order)
+                                   or [c for c in self.spot_data if c not in metadata])
+            self.spot_vectors = self._matrix(self.spot_data, self.spot_gene_order)
+        self.faiss_index = None
 
     def preprocess(self):
-        print("开始数据预处理...")
+        if len(self.spot_gene_order) != 785:
+            raise ValueError('RACF queries must contain the 785 directly predicted genes.')
+        self.canonical_gene_order = list(self.spot_gene_order)
+        if not set(self.canonical_gene_order).issubset(self.full_gene_order):
+            raise ValueError('Every core query gene must also belong to the full reference output.')
+        self.shared_genes = list(self.canonical_gene_order)
+        self.database_vectors = self._matrix(self.database, self.canonical_gene_order)
+        # Do not standardize, variance-weight, or alter cosine geometry.
+        self.spot_vectors = np.ascontiguousarray(self.spot_vectors, dtype=np.float32)
 
-        if self.database_gene_order is None:
-            self.database_gene_order = self.database.columns[1:].tolist()
-
-        if self.spot_gene_order is None and hasattr(self, 'spot_data'):
-            self.spot_gene_order = self.spot_data.columns[1:].tolist()
-
-        if self.spot_gene_order is not None and self.database_gene_order is not None:
-            self.shared_genes = list(set(self.database_gene_order) & set(self.spot_gene_order))
-            print(f"共同基因数量: {len(self.shared_genes)}")
-
-            if len(self.shared_genes) == 0:
-                raise ValueError("数据库和Spot数据没有共同的基因，请检查基因顺序文件")
-
-            self.canonical_gene_order = self.shared_genes
-
-            print("执行基因顺序对齐...")
-            self.database_vectors = self.align_gene_order(
-                self.database_vectors, self.database_gene_order, self.canonical_gene_order
-            )
-            self.database_gene_order = self.canonical_gene_order
-
-            self.spot_vectors = self.align_gene_order(
-                self.spot_vectors, self.spot_gene_order, self.canonical_gene_order
-            )
-            self.spot_gene_order = self.canonical_gene_order
-
-        print("执行标准化处理...")
-
-        self.database_vectors = np.nan_to_num(self.database_vectors, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if hasattr(self, 'spot_vectors') and self.spot_vectors is not None:
-            self.spot_vectors = np.nan_to_num(self.spot_vectors, nan=0.0, posinf=0.0, neginf=0.0)
-
-        print("预处理完成！")
-        print(f"数据库向量形状: {self.database_vectors.shape}")
-        if hasattr(self, 'spot_vectors') and self.spot_vectors is not None:
-            print(f"Spot向量形状: {self.spot_vectors.shape}")
+    def _pad(self, vectors):
+        return np.ascontiguousarray(np.pad(vectors, ((0, 0), (0, self.index_dim - vectors.shape[1]))),
+                                    dtype=np.float32)
 
     def build_index(self):
-        print("构建FAISS索引...")
-        d = self.database_vectors.shape[1]
-        self.faiss_index = faiss.IndexFlatL2(d)
-        self.faiss_index.add(self.database_vectors.astype('float32'))
-        print("FAISS索引构建完成！")
+        n, d = self.database_vectors.shape
+        # 785 is not divisible by usual PQ subquantizer counts. Zero padding preserves L2.
+        self.index_dim = ((d + self.pq_m - 1) // self.pq_m) * self.pq_m
+        bits = min(self.nbits, int(np.floor(np.log2(n))))
+        lists = min(self.nlist, max(1, n // 40))
+        quantizer = faiss.IndexFlatL2(self.index_dim)
+        self.faiss_index = faiss.IndexIVFPQ(quantizer, self.index_dim, lists, self.pq_m, bits)
+        self.faiss_index.cp.seed = self.seed
+        self.faiss_index.pq.cp.seed = self.seed
+        references = self._pad(self.database_vectors)
+        self.faiss_index.train(references)
+        self.faiss_index.add(references)
+        self.faiss_index.nprobe = min(self.nprobe, lists)
 
-    def calculate_similarity(self, spot_vector, database_vectors):
-        def weighted_cosine_similarity(v1, v2):
-            weights = np.std(database_vectors, axis=0)
-            weights = weights / np.sum(weights)
+    @staticmethod
+    def calculate_similarity(spot_vector, database_vectors):
+        denominator = (np.linalg.norm(spot_vector)
+                       * np.linalg.norm(database_vectors, axis=1)).clip(min=1e-12)
+        return (database_vectors @ spot_vector) / denominator
 
-            v1_weighted = v1 * weights
-            v2_weighted = v2 * weights
-
-            dot_product = np.dot(v1_weighted, v2_weighted.T)
-            norm_v1 = np.linalg.norm(v1_weighted)
-            norm_v2 = np.linalg.norm(v2_weighted, axis=1)
-
-            return dot_product / (norm_v1 * norm_v2 + 1e-8)
-
-        def jaccard_similarity(v1, v2):
-            v1_bin = (v1 > np.percentile(v1, 80)).astype(int)
-            v2_bin = (v2 > np.percentile(v2, 80, axis=1, keepdims=True)).astype(int)
-
-            intersection = np.sum(v1_bin * v2_bin, axis=1)
-            union = np.sum(v1_bin | v2_bin, axis=1)
-
-            return intersection / (union + 1e-8)
-
-        cosine_sim = weighted_cosine_similarity(spot_vector, database_vectors)
-        jaccard_sim = jaccard_similarity(spot_vector, database_vectors)
-
-        composite_sim = 0.7 * cosine_sim + 0.3 * jaccard_sim
-
-        return composite_sim
+    def calculate_final_expression(self, recommended_indices, method='weighted_average',
+                                   query_vector=None):
+        if method != 'weighted_average':
+            raise ValueError('The manuscript uses temperature-weighted full reference profiles.')
+        if query_vector is None:
+            raise ValueError('Query-dependent cosine weights require the current core prediction.')
+        similarities = self.calculate_similarity(
+            query_vector, self.database_vectors[recommended_indices])
+        logits = similarities / self.tau
+        weights = np.exp(logits - logits.max())
+        weights /= weights.sum()
+        return weights @ self.full_expression[recommended_indices]
 
     def generate_recommendations(self, spot_data=None, calculate_final_expression=False):
         if spot_data is not None:
-            self.load_data(spot_data)
-            self.preprocess()
-            self.build_index()
-
-        recommendations = {}
-        final_expressions = []
-
-        print(f"为每个spot生成 {self.k} 个推荐...")
-
-        for i, spot_vec in enumerate(self.spot_vectors):
-            if i % 100 == 0:
-                print(f"处理第 {i} 个spot...")
-
-            spot_vec_float32 = spot_vec.astype('float32').reshape(1, -1)
-            distances, candidate_indices = self.faiss_index.search(spot_vec_float32, self.n_candidates)
-            candidate_indices = candidate_indices[0]
-
-            candidate_vectors = self.database_vectors[candidate_indices]
-
-            similarities = self.calculate_similarity(spot_vec, candidate_vectors)
-
-            precise_indices = np.argsort(similarities)[-self.n_precise:][::-1]
-            precise_candidates = candidate_indices[precise_indices]
-            precise_similarities = similarities[precise_indices]
-
-            n_clusters = min(2 * self.k, 100)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
-            cluster_labels = kmeans.fit_predict(self.database_vectors[precise_candidates])
-
-            cluster_representatives = {}
-            for idx, cluster in enumerate(cluster_labels):
-                if cluster not in cluster_representatives or precise_similarities[idx] > cluster_representatives[cluster][1]:
-                    cluster_representatives[cluster] = (precise_candidates[idx], precise_similarities[idx])
-
-            representatives = list(cluster_representatives.values())
-            representatives.sort(key=lambda x: x[1], reverse=True)
-
-            if len(representatives) < self.k:
-                all_candidates = list(zip(precise_candidates, precise_similarities))
-                all_candidates.sort(key=lambda x: x[1], reverse=True)
-
-                selected_ids = {rep[0] for rep in representatives}
-                for candidate in all_candidates:
-                    if candidate[0] not in selected_ids:
-                        representatives.append(candidate)
-                        selected_ids.add(candidate[0])
-                        if len(representatives) >= self.k:
-                            break
-
-            final_recommendations = [rep[0] for rep in representatives[:self.k]]
-            recommendations[i] = final_recommendations
-
+            return self.run(spot_data, calculate_final_expression=calculate_final_expression)
+        if self.faiss_index is None:
+            raise ValueError('Call load_data, preprocess and build_index first.')
+        recommendations, expressions = {}, []
+        for i, query in enumerate(self.spot_vectors):
+            _, coarse = self.faiss_index.search(self._pad(query[None]),
+                                               min(self.n_candidates, len(self.database_vectors)))
+            candidates = np.unique(coarse[0][coarse[0] >= 0])
+            if not len(candidates):
+                raise RuntimeError('IVF-PQ found no candidates; increase nprobe.')
+            scores = self.calculate_similarity(query, self.database_vectors[candidates])
+            selected = candidates[np.argsort(-scores, kind='stable')[:self.n_precise]]
+            vectors = self.database_vectors[selected]
+            clusters = min(self.k, len(np.unique(vectors, axis=0)))
+            kmeans = KMeans(n_clusters=clusters, random_state=self.seed, n_init=10).fit(vectors)
+            representatives = []
+            for cluster in range(clusters):
+                members = np.flatnonzero(kmeans.labels_ == cluster)
+                distances = ((vectors[members] - kmeans.cluster_centers_[cluster]) ** 2).sum(1)
+                representatives.append(int(selected[members[np.argmin(distances)]]))
+            recommendations[i] = representatives
             if calculate_final_expression:
-                final_expr = self.calculate_final_expression(final_recommendations)
-                final_expressions.append(final_expr)
-
-        print("推荐生成完成！")
-
-        if calculate_final_expression:
-            return recommendations, np.array(final_expressions)
-        else:
-            return recommendations
-
-    def calculate_final_expression(self, recommended_indices, method='weighted_average'):
-        recommended_vectors = self.database_vectors[recommended_indices]
-
-        if method == 'average':
-            final_expr = np.mean(recommended_vectors, axis=0)
-        elif method == 'weighted_average':
-            final_expr = np.mean(recommended_vectors, axis=0)
-        elif method == 'median':
-            final_expr = np.median(recommended_vectors, axis=0)
-        else:
-            final_expr = np.mean(recommended_vectors, axis=0)
-
-        return final_expr
+                expressions.append(self.calculate_final_expression(representatives, query_vector=query))
+        return ((recommendations, np.asarray(expressions, dtype=np.float32))
+                if calculate_final_expression else recommendations)
 
     def run(self, spot_data, spot_gene_order=None, calculate_final_expression=False):
-        start_time = time.time()
-
         self.load_data(spot_data, spot_gene_order)
-
         self.preprocess()
-
         self.build_index()
+        return self.generate_recommendations(calculate_final_expression=calculate_final_expression)
 
-        results = self.generate_recommendations(None, calculate_final_expression)
-
-        end_time = time.time()
-        print(f"总运行时间: {end_time - start_time:.2f}秒")
-
-        return results
-
-
-if __name__ == "__main__":
-    recommender = RACF(
-        database_path="merged_data/merged_gene_expression.tsv",
-        database_gene_order="merged_data/gene_order.txt",
-        k=10
-    )
-
-    spot_data_path = "merged_data/merged_gene_expression.tsv"
-    spot_gene_order_path = "merged_data/gene_order.txt"
-    recommendations = recommender.run(spot_data_path, spot_gene_order_path)
-
-    for spot_idx, rec_indices in recommendations.items():
-        print(f"Spot {spot_idx} 的推荐: {rec_indices}")
-        if spot_idx == 5:
-            break
